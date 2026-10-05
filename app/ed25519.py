@@ -9,6 +9,14 @@ Python 3.11 环境中均可启动。密钥为 32 字节种子；签名是确定�
 - public_key_from_seed(seed) -> 32 字节原始公钥
 - sign(seed, message)        -> 64 字节签名
 - verify(public_key, message, signature) -> bool（任何异常都归为 False）
+- is_valid_public_key(public_key) -> bool（严格公钥有效性判定）
+
+公钥有效性（验签与验真共用的安全前提）：只接受 32 字节**规范编码**、
+位于曲线上、**非低阶**且**位于素数阶子群**的点。单位元及其他低阶点
+（阶 1/2/4/8）必须拒绝——否则伪造者提交低阶公钥并搭配全零标量
+（S = 0）的“签名”即可使验签等式对任意消息成立；非规范编码
+（y >= q，或 x = 0 而符号位置 1）与不在素数阶子群的“混合阶”点
+同样拒绝：合法 Ed25519 公钥必为 [a]B，阶恰为 L。
 """
 from __future__ import annotations
 
@@ -80,6 +88,7 @@ def _encode_point(P: tuple[int, int, int, int]) -> bytes:
 
 
 def _decode_point(data: bytes) -> tuple[int, int, int, int]:
+    """按 RFC 8032 §5.1.3 严格解码：长度、域范围与符号位均为规范编码才接受。"""
     if len(data) != 32:
         raise ValueError("点编码必须为 32 字节")
     y = int.from_bytes(data, "little") & ((1 << 255) - 1)
@@ -87,6 +96,9 @@ def _decode_point(data: bytes) -> tuple[int, int, int, int]:
     if y >= _Q:
         raise ValueError("点编码超出域范围")
     x = _xrecover(y, checked=True)
+    if x == 0 and sign:
+        # x 为零时符号位必须为零（否则同一单位元/二阶点有两种编码，属非规范编码）
+        raise ValueError("点编码非规范：x 为零时符号位必须为零")
     if (x & 1) != sign:
         x = _Q - x
     return (x, y, 1, (x * y) % _Q)
@@ -98,6 +110,33 @@ def _clamped_scalar(seed: bytes) -> tuple[int, bytes]:
     a &= (1 << 254) - 8
     a |= 1 << 254
     return a, h[32:]
+
+
+def _is_small_order(P: tuple[int, int, int, int]) -> bool:
+    """P 是否属于阶整除 8 的小子群（含单位元）：[8]P 是否为单位元。"""
+    Q = P
+    for _ in range(3):
+        Q = _ed_add(Q, Q)
+    return _encode_point(Q) == _encode_point(_IDENTITY)
+
+
+def _in_prime_subgroup(P: tuple[int, int, int, int]) -> bool:
+    """P 是否位于阶为 L 的素数阶子群：[L]P 是否为单位元。"""
+    return _encode_point(_scalarmult(P, _L)) == _encode_point(_IDENTITY)
+
+
+def is_valid_public_key(public_key: bytes) -> bool:
+    """严格公钥有效性判定：32 字节规范编码、曲线上的点、非低阶且在素数阶子群。
+
+    单位元及其他低阶点（阶 1/2/4/8）必须拒绝：此类公钥配合全零标量
+    （S = 0）的伪造“签名”可使验签等式对任意消息成立。不在素数阶子群的
+    “混合阶”点同样拒绝——合法公钥必为 [a]B，阶恰为 L。任何异常归为 False。
+    """
+    try:
+        A = _decode_point(public_key)
+    except (ValueError, IndexError):
+        return False
+    return not _is_small_order(A) and _in_prime_subgroup(A)
 
 
 def public_key_from_seed(seed: bytes) -> bytes:
@@ -122,11 +161,15 @@ def sign(seed: bytes, message: bytes) -> bytes:
 
 
 def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
-    """验签；公钥/签名格式非法或等式不成立一律返回 False，不抛异常。"""
+    """验签；公钥/签名非法（含低阶或非子群公钥）或等式不成立一律返回 False。"""
     try:
         if len(public_key) != 32 or len(signature) != 64:
             return False
         A = _decode_point(public_key)
+        # 公钥有效性是验签的安全前提：单位元/低阶点或不在素数阶子群的公钥
+        # 会让全零标量（S = 0）伪造签名通过等式，必须在验签层一并拒绝
+        if _is_small_order(A) or not _in_prime_subgroup(A):
+            return False
         R = _decode_point(signature[:32])
         S = int.from_bytes(signature[32:], "little")
         if S >= _L:

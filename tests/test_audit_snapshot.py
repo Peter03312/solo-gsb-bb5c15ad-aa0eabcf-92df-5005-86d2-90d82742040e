@@ -720,6 +720,132 @@ def test_verify_bad_signature_format(client, issued_pkg):
 
 
 # ---------------------------------------------------------------------------
+# 验真公钥有效性：单位元/低阶点/非规范编码不得通过（伪造快照修复回归）
+#
+# 攻击：伪造者提交单位元（或其他低阶）公钥，并搭配 R=单位元、S=0（全零
+# 标量）的“签名”——验签等式 [S]B = R + [k]A 对任意快照内容成立，服务端
+# 从未签发的快照被判 valid=true。修复后：解析层拒绝此类公钥（400 公钥
+# 无效），验签层兜底判负（400 签名不匹配），绝不返回 valid=true，
+# 错误体不回显快照内容。
+# ---------------------------------------------------------------------------
+
+# 单位元（阶 1）的规范编码：y = 1, x = 0
+_IDENTITY_RAW = b"\x01" + b"\x00" * 31
+# 全零标量伪造签名：R = 单位元编码，S = 0
+_ZERO_SCALAR_SIG = base64.b64encode(_IDENTITY_RAW + b"\x00" * 32).decode()
+
+# 阶 1/2/4/8 的全部低阶点规范编码
+_LOW_ORDER_RAWS = [
+    _IDENTITY_RAW,                                            # 阶 1（单位元）
+    ((2**255 - 20).to_bytes(32, "little")),                   # 阶 2：y = q - 1
+    b"\x00" * 32,                                             # 阶 4：y = 0, x 偶
+    b"\x00" * 31 + b"\x80",                                   # 阶 4：y = 0, x 奇
+    bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+    bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"),
+    bytes.fromhex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"),
+    bytes.fromhex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"),
+]
+
+# 非规范编码：x = 0 而符号位置 1（单位元的另一种“编码”）、y >= q
+_NONCANONICAL_RAWS = [
+    b"\x81" + b"\x00" * 31,                                   # 单位元，符号位置 1
+    b"\xff" * 32,                                             # y 远超域范围
+    ((2**255 - 19).to_bytes(32, "little")),                   # y = q（非规范）
+]
+
+
+def _pem_of(raw: bytes) -> str:
+    from app.snapshots import public_key_pem
+
+    return public_key_pem(raw)
+
+
+def _forged_snapshot(pkg):
+    """攻击者凭空编造一份“已清除”快照（服务端从未签发）。"""
+    forged = _tampered(pkg["snapshot"], status="purged", digest="f" * 64)
+    forged["records"][0]["detail"] = "FORGED-SNAPSHOT-MARKER 伪造内容标记"
+    return forged
+
+
+def test_identity_key_zero_scalar_forgery_rejected(client, issued_pkg):
+    """单位元公钥 + 全零标量签名伪造的快照不得判为有效（核心攻击场景）。"""
+    pkg, _ = issued_pkg
+    forged = _forged_snapshot(pkg)
+
+    for key_form in (
+        base64.b64encode(_IDENTITY_RAW).decode(),             # base64 原始公钥
+        "-----BEGIN PUBLIC KEY-----\n"
+        + base64.b64encode(bytes.fromhex("302a300506032b6570032100") + _IDENTITY_RAW).decode()
+        + "\n-----END PUBLIC KEY-----",                       # PEM（SPKI）形式
+    ):
+        r = _verify(client, forged, _ZERO_SCALAR_SIG, key_form)
+        assert r.status_code == 400, r.text
+        assert "公钥无效" in r.json()["detail"]
+        # 绝不返回 valid=true；错误体不回显快照内容
+        assert r.json().get("valid") is not True
+        assert "FORGED-SNAPSHOT-MARKER" not in r.text
+        assert "records" not in r.text
+
+
+def test_low_order_public_keys_rejected(client, issued_pkg):
+    """阶 1/2/4/8 的全部低阶点公钥：真实签名也一律拒绝（公钥无效 400）。"""
+    pkg, _ = issued_pkg
+    snap, sig = pkg["snapshot"], pkg["signature"]
+    for raw in _LOW_ORDER_RAWS:
+        for key_form in (base64.b64encode(raw).decode(), _pem_of(raw)):
+            r = _verify(client, snap, sig, key_form)
+            assert r.status_code == 400, (raw.hex(), r.text)
+            assert "公钥无效" in r.json()["detail"]
+            assert r.json().get("valid") is not True
+
+
+def test_noncanonical_public_key_encodings_rejected(client, issued_pkg):
+    """非规范编码公钥（x=0 符号位置 1、y >= q）一律 400 公钥无效。"""
+    pkg, _ = issued_pkg
+    snap, sig = pkg["snapshot"], pkg["signature"]
+    for raw in _NONCANONICAL_RAWS:
+        r = _verify(client, snap, sig, base64.b64encode(raw).decode())
+        assert r.status_code == 400 and "公钥无效" in r.json()["detail"], raw.hex()
+
+
+def test_mixed_order_public_key_rejected(client, issued_pkg):
+    """不在素数阶子群的“混合阶”点（素数阶点 + 扭点）同样不得作为验真公钥。"""
+    from app import ed25519
+    from app.snapshots import parse_public_key
+
+    pkg, pk = issued_pkg
+    server_raw = parse_public_key(pk["public_key"])
+    A = ed25519._decode_point(server_raw)
+    torsion = ed25519._decode_point((2**255 - 20).to_bytes(32, "little"))  # 二阶点
+    mixed = ed25519._encode_point(ed25519._ed_add(A, torsion))
+    assert mixed != server_raw  # 确为曲线上的另一点
+
+    r = _verify(client, pkg["snapshot"], pkg["signature"], base64.b64encode(mixed).decode())
+    assert r.status_code == 400 and "公钥无效" in r.json()["detail"]
+    assert r.json().get("valid") is not True
+
+
+def test_ed25519_verify_layer_rejects_weak_keys():
+    """验签层兜底：即使绕过公钥解析，低阶/非子群公钥验签也一律判负。"""
+    from app import ed25519
+
+    msg = b'{"status":"purged"}'
+    zero_sig = _IDENTITY_RAW + b"\x00" * 32
+    for raw in _LOW_ORDER_RAWS + _NONCANONICAL_RAWS:
+        assert not ed25519.is_valid_public_key(raw), raw.hex()
+        assert not ed25519.verify(raw, msg, zero_sig), raw.hex()
+
+    # 合法密钥：有效性判定通过，签名验真与篡改判负均不受影响
+    seed = bytes(range(32))
+    pk = ed25519.public_key_from_seed(seed)
+    sig = ed25519.sign(seed, msg)
+    assert ed25519.is_valid_public_key(pk)
+    assert ed25519.verify(pk, msg, sig)
+    assert not ed25519.verify(pk, msg + b"x", sig)
+
+
+
+# ---------------------------------------------------------------------------
 # 重启后旧签名仍可验证（密钥随库持久化）
 # ---------------------------------------------------------------------------
 

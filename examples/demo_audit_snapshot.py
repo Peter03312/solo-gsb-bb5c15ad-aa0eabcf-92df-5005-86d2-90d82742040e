@@ -9,7 +9,10 @@
    截止序号的审计记录，不含正文与密钥；
 4) 复核人提交“快照 + 签名 + 事先信任的公钥”验真（POST /audit-snapshots/verify）；
 5) 篡改字段 / 调换审计记录顺序 / 换版本号 / 用错公钥 -> 全部明确失败；
-6) 交接后旧封存人不得再签发（统一 403）。
+6) 本轮修复：攻击者用 Ed25519 单位元（及其他低阶/非规范编码）公钥搭配
+   全零标量（S = 0）伪造“任意内容都可验真”的包 -> 400 公钥无效，
+   绝不返回 valid=true，错误体不回显快照内容；合法签名不受影响；
+7) 交接后旧封存人不得再签发（统一 403）。
 
 用法: python examples/demo_audit_snapshot.py [base_url]
 """
@@ -121,6 +124,48 @@ def main() -> None:
                                 "public_key": "not-a-public-key"})
     show("公钥无效 -> 明确失败", status, out)
     assert status == 400
+
+    # 6.5) 本轮修复：单位元/低阶公钥 + 全零标量签名的伪造包不得通过验真。
+    # 攻击者无需任何私钥：取 Ed25519 单位元编码（y=1, x=0）作为“公钥”，
+    # 签名取 R=单位元、S=0（全零标量）——验签等式 [S]B = R + [k]A 对任意
+    # 快照内容都成立。修复后解析层即拒绝此类公钥（400 公钥无效）。
+    import base64
+    identity_raw = b"\x01" + b"\x00" * 31                     # 单位元（阶 1）
+    zero_scalar_sig = base64.b64encode(identity_raw + b"\x00" * 32).decode()
+    forged = json.loads(json.dumps(snap))
+    forged["status"] = "purged"                               # 凭空编造“已清除”
+    forged["records"][0]["detail"] = "FORGED-MARKER 伪造内容"
+    for key_form in (
+        base64.b64encode(identity_raw).decode(),              # base64 原始公钥
+        "-----BEGIN PUBLIC KEY-----\n"
+        + base64.b64encode(bytes.fromhex("302a300506032b6570032100") + identity_raw).decode()
+        + "\n-----END PUBLIC KEY-----",                       # PEM（SPKI）形式
+    ):
+        status, out = call("POST", "/audit-snapshots/verify",
+                           payload={"snapshot": forged, "signature": zero_scalar_sig,
+                                    "public_key": key_form})
+        show("单位元公钥 + 全零标量伪造包 -> 400 公钥无效", status, out)
+        assert status == 400 and out.get("valid") is not True
+        assert "FORGED-MARKER" not in json.dumps(out, ensure_ascii=False)
+    # 其他低阶点（阶 2/4/8）与非规范编码（x=0 符号位置 1）同样拒绝
+    low_order = [
+        ((2**255 - 20).to_bytes(32, "little")),               # 阶 2
+        b"\x00" * 32,                                         # 阶 4
+        bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),  # 阶 8
+        b"\x81" + b"\x00" * 31,                               # 单位元非规范编码
+    ]
+    for raw in low_order:
+        status, out = call("POST", "/audit-snapshots/verify",
+                           payload={"snapshot": forged, "signature": zero_scalar_sig,
+                                    "public_key": base64.b64encode(raw).decode()})
+        assert status == 400 and out.get("valid") is not True, (raw.hex(), out)
+    show("低阶点（阶 2/4/8）与非规范编码公钥 -> 全部 400", 400, {"detail": "公钥无效：…"})
+    # 合法服务端公钥签发的快照仍正常验真（修复不影响合法流量）
+    status, out = call("POST", "/audit-snapshots/verify",
+                       payload={"snapshot": snap, "signature": pkg["signature"],
+                                "public_key": trusted_key})
+    show("合法快照仍验真通过", status, out)
+    assert status == 200 and out["valid"] is True
 
     # 7) 交接后旧封存人不得再签发
     deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
