@@ -684,6 +684,116 @@ def test_verify_wrong_but_valid_key_fails(client, issued_pkg):
     assert r.status_code == 400 and "签名不匹配" in r.json()["detail"]
 
 
+# ---------------------------------------------------------------------------
+# 安全回归：单位元/全零等低阶公钥与非规范编码不得通过验真
+# ---------------------------------------------------------------------------
+
+# Ed25519 8 阶扭转子群的低阶点编码（含单位元 0x01..、唯一阶 2 点 (0,-1)）
+# 扭转子群（循环 8 阶）的一个 8 阶生成元，其 0..7 倍即全部 8 个低阶点
+_TORSION_GENERATOR = bytes.fromhex(
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
+)
+
+
+def _all_low_order_encodings():
+    """枚举 Ed25519 全部 8 个低阶点的规范编码（扭转子群为循环 8 阶）。"""
+    from app import ed25519
+
+    g = ed25519._decode_point(_TORSION_GENERATOR)
+    pts = {ed25519._encode_point(ed25519._scalarmult(g, i)) for i in range(8)}
+    assert len(pts) == 8
+    return pts
+
+
+def test_verify_rejects_identity_pubkey_zero_scalar_forgery(client, issued_pkg):
+    """单位元公钥 + 全零/单位元签名伪造的快照不得判为 valid（核心伪造用例）。"""
+    from app.snapshots import public_key_pem
+
+    pkg, _ = issued_pkg
+    snap = pkg["snapshot"]
+    identity = b"\x01" + b"\x00" * 31  # 点 (0,1) 的规范编码
+    forged_sigs = [
+        b"\x00" * 64,                          # R=全零低阶点, S=0
+        identity + b"\x00" * 32,               # R=单位元, S=0
+        b"\x00" * 32 + bytes([1]) + b"\x00" * 31,  # R=全零, S=1
+    ]
+    for bad_pk in (base64.b64encode(identity).decode(), public_key_pem(identity)):
+        for raw_sig in forged_sigs:
+            r = _verify(client, snap, base64.b64encode(raw_sig).decode(), bad_pk)
+            assert r.status_code == 400, r.text
+            assert r.json().get("valid") is not True
+            assert "公钥无效" in r.json()["detail"], r.text
+
+
+def test_verify_rejects_all_zero_pubkey_with_torsion_R(client, issued_pkg):
+    """全零公钥（阶 4 低阶点）：即便攻击者在 8 个扭转点中挑选 R 也无法伪造。"""
+    pkg, _ = issued_pkg
+    snap = pkg["snapshot"]
+    zero_pk = base64.b64encode(b"\x00" * 32).decode()
+    # 修复前：穷举扭转子群 R、S=0 可使验签等式恒成立；修复后一律“公钥无效”
+    for R_enc in _all_low_order_encodings():
+        r = _verify(client, snap, base64.b64encode(R_enc + b"\x00" * 32).decode(), zero_pk)
+        assert r.status_code == 400 and "公钥无效" in r.json()["detail"]
+
+
+def test_verify_rejects_every_low_order_pubkey(client, issued_pkg):
+    """全部 8 个低阶点（任意 PEM/裸 base64 封装）解析阶段即拒绝，不进入验签。"""
+    from app.snapshots import public_key_pem
+
+    pkg, _ = issued_pkg
+    snap, sig = pkg["snapshot"], pkg["signature"]
+    assert len(_all_low_order_encodings()) == 8  # 扭转子群恰有 8 个点
+    for raw in _all_low_order_encodings():
+        for bad_pk in (base64.b64encode(raw).decode(), public_key_pem(raw)):
+            r = _verify(client, snap, sig, bad_pk)
+            assert r.status_code == 400 and "公钥无效" in r.json()["detail"], raw.hex()
+            assert r.json().get("valid") is not True
+
+
+def test_verify_rejects_non_canonical_pubkey_encoding(client, issued_pkg):
+    """非规范点编码（x=0 却带符号位、y>=q）一律按“公钥无效”拒绝。"""
+    pkg, _ = issued_pkg
+    snap, sig = pkg["snapshot"], pkg["signature"]
+    bad_keys = [
+        b"\x01" + b"\x00" * 30 + b"\x80",   # 单位元强行置符号位
+        b"\x00" * 31 + b"\x80",             # 另一个 y=0 点强行置符号位
+        b"\xff" * 32,                       # y >= q，曲线外
+    ]
+    for raw in bad_keys:
+        r = _verify(client, snap, sig, base64.b64encode(raw).decode())
+        assert r.status_code == 400 and "公钥无效" in r.json()["detail"], raw.hex()
+
+
+def test_verify_rejects_non_canonical_R_encoding(client, issued_pkg):
+    """合法公钥下，R 段为非规范点编码的签名仍判签名不匹配，不抛 500。"""
+    pkg, pk = issued_pkg
+    snap = pkg["snapshot"]
+    # R 为单位元非规范编码（带符号位），S=0
+    bad_sig = base64.b64encode(b"\x01" + b"\x00" * 30 + b"\x80" + b"\x00" * 32).decode()
+    r = _verify(client, snap, bad_sig, pk["public_key"])
+    assert r.status_code == 400 and "签名不匹配" in r.json()["detail"]
+
+
+def test_verify_error_body_never_echoes_snapshot(client, issued_pkg):
+    """公钥无效/签名不匹配的错误体不回显快照任何内容（摘要/记录/自定义细节）。"""
+    pkg, pk = issued_pkg
+    snap, sig, pem = pkg["snapshot"], pkg["signature"], pk["public_key"]
+    # 给快照放入醒目的攻击者标记；任何 400 错误响应都不得带它
+    marked = _tampered(snap, digest="DEADBEEF-MARKER", status="purged")
+    marked["records"].append(
+        {"seq": 424242, "at": "2026-01-01T00:00:00Z", "action": "MARKER-ACTION",
+         "actor": "mallory", "request_id": None, "detail": "MARKER-DETAIL"}
+    )
+
+    r = _verify(client, marked, sig, base64.b64encode(b"\x00" * 32).decode())
+    assert r.status_code == 400
+    assert "DEADBEEF-MARKER" not in r.text and "MARKER" not in r.text and "mallory" not in r.text
+
+    r = _verify(client, marked, base64.b64encode(b"\x00" * 64).decode(), pem)
+    assert r.status_code == 400
+    assert "DEADBEEF-MARKER" not in r.text and "MARKER" not in r.text and "mallory" not in r.text
+
+
 def test_verify_does_not_trust_bundled_key(client, issued_pkg):
     """攻击者自签的伪造快照即使用包内自带公钥也无法冒充：验真只认提交的公钥。"""
     from app import ed25519

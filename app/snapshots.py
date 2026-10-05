@@ -61,8 +61,10 @@ def public_key_pem(raw: bytes) -> str:
 def parse_public_key(text: str) -> bytes:
     """把 PEM（Ed25519 SPKI）或 base64 编码的 32 字节原始公钥解析为原始公钥。
 
-    任何格式问题（无法解码、长度/前缀不符、点不在曲线上）都抛 ValueError，
-    由调用方统一映射为“公钥无效”。
+    任何格式问题（无法解码、长度/前缀不符、点不在曲线上、非规范编码，
+    或单位元等低阶点）都抛 ValueError，由调用方统一映射为“公钥无效”。
+    低阶/非规范公钥必须在解析阶段拒绝：这类公钥下攻击者无需私钥即可
+    用全零或小标量伪造任意消息的签名，绝不允许进入验签。
     """
     if not isinstance(text, str):
         raise ValueError("公钥必须为字符串")
@@ -92,8 +94,9 @@ def parse_public_key(text: str) -> bytes:
             raise ValueError("公钥既不是 PEM 也不是 base64 原始公钥") from exc
         if len(raw) != 32:
             raise ValueError("原始公钥必须为 32 字节")
-    # 必须是曲线上的有效点，否则属于“公钥无效”而非“签名不匹配”
-    ed25519._decode_point(raw)
+    # 规范曲线点编码且非低阶（含单位元/全零点），否则属于“公钥无效”
+    # 而非“签名不匹配”：低阶公钥不构成可验证身份，必须在验签前拒绝
+    ed25519.decode_public_key(raw)
     return raw
 
 

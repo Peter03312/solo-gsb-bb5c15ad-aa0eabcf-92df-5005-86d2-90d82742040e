@@ -9,10 +9,13 @@
    截止序号的审计记录，不含正文与密钥；
 4) 复核人提交“快照 + 签名 + 事先信任的公钥”验真（POST /audit-snapshots/verify）；
 5) 篡改字段 / 调换审计记录顺序 / 换版本号 / 用错公钥 -> 全部明确失败；
-6) 交接后旧封存人不得再签发（统一 403）。
+6) 攻击者用 Ed25519 单位元/全零等低阶公钥 + 全零或小标量签名伪造快照
+   （服务端从未签发）-> 公钥无效，400，不返回 valid=true，错误体不回显快照；
+7) 交接后旧封存人不得再签发（统一 403）。
 
 用法: python examples/demo_audit_snapshot.py [base_url]
 """
+import base64
 import json
 import sys
 import urllib.error
@@ -121,6 +124,44 @@ def main() -> None:
                                 "public_key": "not-a-public-key"})
     show("公钥无效 -> 明确失败", status, out)
     assert status == 400
+
+    # 6b) 低阶公钥伪造：单位元公钥（0x01..）+ R=单位元、S=0 的全零标量签名。
+    #     RFC 8032 原始验签等式下该组合对任意消息恒成立，但服务端从未签发；
+    #     修复后公钥在解析阶段即判“公钥无效”，绝不返回 valid=true。
+    identity_pk = base64.b64encode(b"\x01" + b"\x00" * 31).decode()
+    forged_sig = base64.b64encode(b"\x01" + b"\x00" * 63).decode()
+    forged = json.loads(json.dumps(snap))
+    forged["status"] = "purged"  # 攻击者想让复核人相信资料已被清除
+    status, out = call("POST", "/audit-snapshots/verify",
+                       payload={"snapshot": forged, "signature": forged_sig,
+                                "public_key": identity_pk})
+    show("单位元公钥+零标量伪造 -> 公钥无效", status, out)
+    assert status == 400 and out.get("valid") is not True and "公钥无效" in out["detail"]
+    # 错误响应只含一句固定提示，不回显快照任何内容
+    assert "purged" not in json.dumps(out, ensure_ascii=False)
+
+    # 全零公钥（阶 4 低阶点）+ 全零签名同样在解析阶段拒绝
+    zero_pk = base64.b64encode(b"\x00" * 32).decode()
+    zero_sig = base64.b64encode(b"\x00" * 64).decode()
+    status, out = call("POST", "/audit-snapshots/verify",
+                       payload={"snapshot": forged, "signature": zero_sig,
+                                "public_key": zero_pk})
+    show("全零低阶公钥+全零签名伪造 -> 公钥无效", status, out)
+    assert status == 400 and "公钥无效" in out["detail"]
+
+    # 非规范编码公钥（给单位元强行置符号位）同样拒绝
+    noncanonical_pk = base64.b64encode(b"\x01" + b"\x00" * 30 + b"\x80").decode()
+    status, out = call("POST", "/audit-snapshots/verify",
+                       payload={"snapshot": snap, "signature": zero_sig,
+                                "public_key": noncanonical_pk})
+    show("非规范编码公钥 -> 公钥无效", status, out)
+    assert status == 400 and "公钥无效" in out["detail"]
+
+    # 真包不受影响：合法服务端公钥签发的快照依旧验真通过
+    status, out = call("POST", "/audit-snapshots/verify",
+                       payload={"snapshot": snap, "signature": pkg["signature"],
+                                "public_key": trusted_key})
+    assert status == 200 and out["valid"] is True
 
     # 7) 交接后旧封存人不得再签发
     deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
